@@ -1,0 +1,292 @@
+import csv
+import json
+from collections import defaultdict
+
+SERVICES_CSV = "Oservices_data.csv"
+PATTERNS_CSV = "OWR-patterns-consolidated-sequential.csv"
+SUPPLY_CSV   = "WR_supply.csv"
+
+OUT_DOWN_EVENTS_CSV = "1-o-event-ids_DOWN.csv"
+OUT_UP_EVENTS_CSV   = "1-o-event-ids_UP.csv"
+OUT_JSON = "milp_preprocessed.json"
+
+DEP_BASE = 20000
+ARR_BASE = 100
+
+# ============================================================
+# helpers
+# ============================================================
+def read_csv_dict(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return [{k.strip(): (v.strip() if v else "") for k,v in r.items()}
+                for r in csv.DictReader(f)]
+
+def read_csv_rows(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.reader(f))
+
+def safe_int(x, d=0):
+    try: return int(float(x))
+    except: return d
+
+def norm(x): return (x or "").strip()
+
+# ============================================================
+# inputs
+# ============================================================
+services = read_csv_dict(SERVICES_CSV)
+patterns_raw = read_csv_rows(PATTERNS_CSV)
+supply_raw = read_csv_rows(SUPPLY_CSV)
+
+# ============================================================
+# station sequence (ONLY for CSV headers)
+# ============================================================
+def extract_station_sequence(rows):
+    for r in rows:
+        if len(r)>=2 and r[1].lower()=="station":
+            out=[]
+            for s in r[2:]:
+                s=norm(s)
+                if not s or "total" in s.lower(): break
+                out.append(s)
+            return out
+    return []
+
+STATION_DOWN = extract_station_sequence(supply_raw)
+STATION_UP = list(reversed(STATION_DOWN))
+
+# ============================================================
+# PATTERN PARSER (FIXED: BIDIRECTIONAL SEGMENTS)
+# ============================================================
+def parse_patterns(rows):
+    header = rows[0]
+    pid = header.index("Pattern_ID")
+
+    patterns = {}
+
+    # detect ordered Major_Segment columns
+    seg_cols = []
+    for i,h in enumerate(header):
+        if h.startswith("Major_Segment_"):
+            k = int(h.split("_")[-1])
+            seg_cols.append((k,i))
+    seg_cols.sort()
+
+    for r in rows[1:]:
+        if len(r)<=pid: 
+            continue
+
+        p = r[pid].strip()
+        if not p: 
+            continue
+
+        ordered_pairs=[]
+        pair_time={}
+
+        for k,i in seg_cols:
+            seg = r[i].strip()
+            if not seg or "-" not in seg:
+                continue
+
+            tcol = header.index(f"Time_{k}")
+            a,b = seg.split("-",1)
+            a=norm(a); b=norm(b)
+            t=safe_int(r[tcol],0)
+
+            ordered_pairs.append((a,b))
+            pair_time[(a,b)] = t
+            pair_time[(b,a)] = t   # symmetry
+
+        patterns[p] = {
+            "ordered": ordered_pairs,
+            "times": pair_time
+        }
+
+    return patterns
+PATTERNS = parse_patterns(patterns_raw)
+
+
+# ============================================================
+# CSV headers (unchanged)
+# ============================================================
+def make_header(seq):
+    h=["SrNum","Time","Type","Dir","PatNum","From","To"]
+    for s in seq:
+        h+=[s+"a",s+"d"]
+    return h
+
+DOWN_HEADER = make_header(STATION_DOWN)
+UP_HEADER   = make_header(STATION_UP)
+
+down_rows=[DOWN_HEADER]
+up_rows=[UP_HEADER]
+
+# ============================================================
+# containers
+# ============================================================
+next_dep=DEP_BASE
+next_arr=ARR_BASE
+
+terminal_arr = defaultdict(lambda: {
+    "UP":{"fast":[], "slow":[]},
+    "DOWN":{"fast":[], "slow":[]}
+})
+
+terminal_dep = defaultdict(lambda: {
+    "UP":{"fast":[], "slow":[]},
+    "DOWN":{"fast":[], "slow":[]}
+})
+
+route_deps = defaultdict(list)
+
+milp={
+ "station_sequence":{"DOWN":STATION_DOWN,"UP":STATION_UP},
+ "services":{},
+ "turnaround":{},
+ "distribution":{},
+ "headway":{"UP":{"fast":defaultdict(list),"slow":defaultdict(list)},
+            "DOWN":{"fast":defaultdict(list),"slow":defaultdict(list)}}
+}
+
+# ============================================================
+# MAIN LOOP (EVENT IDS + CSV UNCHANGED)
+# ============================================================
+for s in services:
+
+    sr=safe_int(s["SrNum"])
+    t0=safe_int(s["Time"])
+    d=s["Dir"].strip().upper()
+    tp=s["Type"].strip().lower()
+    pat=s["PatNum"]
+    frm=norm(s["From"])
+    to=norm(s["To"])
+
+    # pattern traversal order ONLY
+    patdata = PATTERNS[pat]
+    ordered_pairs = patdata["ordered"]
+    seg_times = patdata["times"]
+
+    # build stations in pattern direction
+    pairs = ordered_pairs[:]
+    stations = [pairs[0][0]]
+    for a,b in pairs:
+        stations.append(b)
+
+    # if pattern orientation does not match service, reverse it
+    if stations[0] != frm or stations[-1] != to:
+        pairs = list(reversed([(b,a) for (a,b) in ordered_pairs]))
+        stations = [pairs[0][0]]
+        for a,b in pairs:
+            stations.append(b)
+
+    # final validation
+    if stations[0] != frm or stations[-1] != to:
+        raise ValueError(
+            f"Pattern {pat} cannot be aligned with service {sr}: "
+            f"{stations[0]}->{stations[-1]} vs {frm}->{to}"
+        )
+
+    ordered_pairs = pairs
+
+
+
+
+    header = DOWN_HEADER if d=="DOWN" else UP_HEADER
+    row={h:"" for h in header}
+    row.update({"SrNum":sr,"Time":t0,"Type":tp,"Dir":d,"PatNum":pat,"From":frm,"To":to})
+
+    dep0=next_dep; next_dep+=1
+    row[stations[0]+"d"]=str(dep0)
+    milp["headway"][d][tp][stations[0]].append(dep0)
+
+    route_key=f"{stations[0]}-{stations[-1]}-{tp}-{d}"
+    route_deps[route_key].append((t0,dep0))
+
+    segments={}
+    prev=dep0
+
+    for i in range(1,len(stations)):
+        a=stations[i-1]; b=stations[i]
+
+        # 🔥 ONLY CHANGE: traversal from PATTERN (no fallback to 0)
+        dt = seg_times[(a,b)]
+
+        arr=next_arr+1; next_arr=arr
+        row[b+"a"]=str(arr)
+        segments[f"{prev}_{arr}"]=dt
+        prev=arr
+
+        if i<len(stations)-1:
+            dep=next_dep; next_dep+=1
+            row[b+"d"]=str(dep)
+            segments[f"{arr}_{dep}"]=0
+            prev=dep
+            milp["headway"][d][tp][b].append(dep)
+
+    last_arr=prev
+
+    terminal_dep[stations[0]][d][tp].append(dep0)
+    terminal_arr[stations[-1]][d][tp].append(last_arr)
+
+
+    milp["services"][str(sr)]={"start_time":t0,"Dir":d,"Type":tp,"PatNum":pat,
+        "From":stations[0],"To":stations[-1],
+        "segments":segments,"first_dep":dep0,"last_arr":last_arr}
+
+    if d=="DOWN": down_rows.append([row[h] for h in DOWN_HEADER])
+    else: up_rows.append([row[h] for h in UP_HEADER])
+
+# ============================================================
+# turnaround + distribution (unchanged)
+# ============================================================
+turn = {}
+
+for st in terminal_dep:
+    turn[st] = {"fast": [], "slow": []}
+
+    for tp in ["fast","slow"]:
+
+        # DOWN dep -> UP arr  (same type)
+        for ddep in terminal_dep[st]["DOWN"][tp]:
+            for uarr in terminal_arr[st]["UP"][tp]:
+                turn[st][tp].append(f"{ddep}_{uarr}")
+
+        # UP dep -> DOWN arr  (same type)
+        for udep in terminal_dep[st]["UP"][tp]:
+            for darr in terminal_arr[st]["DOWN"][tp]:
+                turn[st][tp].append(f"{udep}_{darr}")
+
+    # remove empty stations
+    if not turn[st]["fast"] and not turn[st]["slow"]:
+        del turn[st]
+
+milp["turnaround"] = turn
+
+
+dist={}
+for rk,it in route_deps.items():
+    it.sort()
+    q=[f"{it[i][1]}_{it[i+1][1]}" for i in range(len(it)-1)]
+    if q: dist[rk]=q
+milp["distribution"]=dist
+
+def normdict(x):
+    if isinstance(x,defaultdict): x=dict(x)
+    if isinstance(x,dict): return {k:normdict(v) for k,v in x.items()}
+    return x
+
+milp["headway"]=normdict(milp["headway"])
+
+# ============================================================
+# WRITE FILES
+# ============================================================
+with open(OUT_DOWN_EVENTS_CSV,"w",newline="",encoding="utf-8") as f:
+    csv.writer(f).writerows(down_rows)
+
+with open(OUT_UP_EVENTS_CSV,"w",newline="",encoding="utf-8") as f:
+    csv.writer(f).writerows(up_rows)
+
+with open(OUT_JSON,"w",encoding="utf-8") as f:
+    json.dump(milp,f,indent=2)
+
+print("DONE")
